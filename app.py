@@ -1,139 +1,163 @@
-import logging
+import json
+import math
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-from geopy.distance import geodesic
-from datetime import datetime, timezone, timedelta
+from ortools.constraint_solver import pywrapcp
+from ortools.constraint_solver import routing_enums_pb2
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
-@app.route('/')
-def home():
-    logger.info("Home route accessed")
-    return "Traveling Vehicle Problem Solver"
+@app.route('/test', methods=['GET'])
+def test():
+    return "Server is running!"
 
-@app.route('/solve_vrp', methods=['POST'])
-def solve_vrp():
+# Function to calculate the Euclidean distance between two points
+def calculate_distance(coord1, coord2):
+    return math.sqrt((coord1['lat'] - coord2['lat'])**2 + (coord1['lng'] - coord2['lng'])**2)
+
+# Function to create the data model for OR-Tools
+def create_data_model(requests):
+    data = {}
+    locations = [request['coordinates'] for request in requests]
+    distance_matrix = [[calculate_distance(loc1, loc2) for loc2 in locations] for loc1 in locations]
+    
+    # Convert pickup and delivery times to manageable units
+    time_windows = []
+    for request in requests:
+        pickup_time = datetime.fromisoformat(request['pickup'][:-1])
+        delivery_time = datetime.fromisoformat(request['delivery'][:-1])
+        # Expand the time window slightly to avoid tight constraints
+        time_window = (int((pickup_time - datetime(1970, 1, 1)).total_seconds()) - 3600,  # 1 hour before
+                       int((delivery_time - datetime(1970, 1, 1)).total_seconds()) + 3600)  # 1 hour after
+        time_windows.append(time_window)
+
+    # Define pickup and delivery pairs with relaxed constraints
+    pickups_deliveries = [(i, i + 1) for i in range(0, len(requests), 2)]
+
+    # Find the index of the request with the earliest pickup time
+    earliest_pickup_index = min(range(len(requests)), key=lambda i: datetime.fromisoformat(requests[i]['pickup'][:-1]))
+
+    data['distance_matrix'] = distance_matrix
+    data['time_windows'] = time_windows
+    data['pickups_deliveries'] = pickups_deliveries
+    data['num_vehicles'] = 1
+    data['depot'] = earliest_pickup_index
+    return data
+
+# Function to solve the VRP problem with flexible pickup and delivery constraints
+def solve_vrp(requests):
+    data = create_data_model(requests)
+    print(f"Data model created: {data}")  # Logging data model
+
     try:
-        data = request.json
-        logger.debug(f"Received data: {data}")
-        locations, deadlines, names = parse_input(data)
-        distance_matrix = calculate_distance_matrix(locations)
-        solution = optimize_routes(locations, deadlines, names, distance_matrix)
-        return jsonify(solution)
+        manager = pywrapcp.RoutingIndexManager(len(data['distance_matrix']), data['num_vehicles'], data['depot'])
+        print("RoutingIndexManager created successfully.")  # Log successful creation
     except Exception as e:
-        logger.error(f"Error occurred: {e}")
-        return jsonify({'error': str(e)}), 500
+        print(f"Exception creating RoutingIndexManager: {str(e)}")
+        return []
 
-def parse_input(data):
-    locations = []
-    deadlines = []
-    names = []
-    
-    # Find the earliest maxTime in the data
-    earliest_entry = min(data, key=lambda x: datetime.fromisoformat(x['maxTime']).replace(tzinfo=timezone.utc))
-    earliest_time = datetime.fromisoformat(earliest_entry['maxTime']).replace(tzinfo=timezone.utc)
-    logger.debug(f"Earliest maxTime: {earliest_time.isoformat()}")
-    
-    # Reorder locations so that the earliest deadline is the first location
-    sorted_data = sorted(data, key=lambda x: datetime.fromisoformat(x['maxTime']).replace(tzinfo=timezone.utc))
-    
-    for entry in sorted_data:
-        coords = entry['coordinates']
-        max_time = datetime.fromisoformat(entry['maxTime']).replace(tzinfo=timezone.utc)
-        name = entry['name']
-        logger.debug(f"Processing location {coords} with maxTime {max_time.isoformat()} and name {name}")
-        deadline_minutes = (max_time - earliest_time).total_seconds() / 60
-        locations.append((coords['lat'], coords['lng']))
-        deadlines.append(deadline_minutes)
-        names.append(name)
-    logger.debug(f"Processed locations: {locations}")
-    logger.debug(f"Processed deadlines (in minutes): {deadlines}")
-    logger.debug(f"Processed names: {names}")
-    return locations, deadlines, names
-
-def calculate_distance_matrix(locations):
-    matrix = []
-    for loc1 in locations:
-        row = []
-        for loc2 in locations:
-            distance = geodesic(loc1, loc2).kilometers
-            travel_time_minutes = (distance / 70) * 60  # Assuming average travel speed of 70 km/h.
-            # Add buffer to travel time to account for delays.
-            travel_time_minutes += 200
-            row.append(travel_time_minutes)
-        matrix.append(row)
-    logger.debug(f"Distance matrix (in minutes): {matrix}")
-    return matrix
-
-def optimize_routes(locations, deadlines, names, distance_matrix):
-    num_locations = len(locations)
-    num_vehicles = 1
-    depot = 0  # Always start from the location with the earliest deadline
-
-    manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, depot)
-    routing = pywrapcp.RoutingModel(manager)
+    try:
+        routing = pywrapcp.RoutingModel(manager)
+        print("RoutingModel created successfully.")  # Log successful creation
+    except Exception as e:
+        print(f"Exception creating RoutingModel: {str(e)}")
+        return []
 
     def distance_callback(from_index, to_index):
-        return int(distance_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return data['distance_matrix'][from_node][to_node]
 
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    try:
+        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+        print("Transit callback and cost evaluator set successfully.")  # Log successful setup
+    except Exception as e:
+        print(f"Exception setting transit callback: {str(e)}")
+        return []
 
-    max_deadline = max(deadlines)
-    logger.debug(f"Max deadline: {max_deadline}")
-    routing.AddDimension(
-        transit_callback_index,
-        0,  # no slack
-        int(max_deadline * 2),  # set a large enough max time
-        True,  # force start cumul to zero
-        "Time"
-    )
-    time_dimension = routing.GetDimensionOrDie("Time")
+    time = 'time'
+    try:
+        routing.AddDimension(
+            transit_callback_index,
+            100000,  # allow larger waiting time
+            100000,  # maximum time per vehicle
+            False,  # Don't force start cumul to zero.
+            time)
+        time_dimension = routing.GetDimensionOrDie(time)
+        print("Time dimension added successfully.")  # Log successful dimension addition
+    except Exception as e:
+        print(f"Exception adding time dimension: {str(e)}")
+        return []
 
-    for idx, deadline in enumerate(deadlines):
-        index = manager.NodeToIndex(idx)
-        start_time = 0
-        end_time = int(deadline)
-        if idx == 0:
-            end_time += 1440  # Add buffer to the first location's deadline
-        else:
-            end_time += 1440  # Add buffer to each subsequent location
-        logger.debug(f"Setting time window for location {index}: [{start_time}, {end_time}]")
-        time_dimension.CumulVar(index).SetRange(start_time, end_time)
+    # Set adjusted time windows for all locations
+    try:
+        for location_idx, (start, end) in enumerate(data['time_windows']):
+            index = manager.NodeToIndex(location_idx)
+            start_readable = datetime.fromtimestamp(start).isoformat()
+            end_readable = datetime.fromtimestamp(end).isoformat()
+            print(f"Setting adjusted time window for location {location_idx}: {start} ({start_readable}) to {end} ({end_readable})")
+            try:
+                time_dimension.CumulVar(index).SetRange(start, end)
+                print(f"Time window for location {location_idx} set successfully.")
+            except Exception as e:
+                print(f"Exception setting time window for location {location_idx}: {str(e)}")
+        print("Adjusted time windows set successfully.")
+    except Exception as e:
+        print(f"Exception during setting adjusted time windows: {str(e)}")
+        return []
 
-    # Ensure the vehicle doesn't need to return to the start point
-    routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(routing.End(0)))
-
-    # Add precedence constraints to enforce visiting order based on deadlines
-    for i in range(len(deadlines) - 1):
-        routing.solver().Add(time_dimension.CumulVar(manager.NodeToIndex(i + 1)) >= time_dimension.CumulVar(manager.NodeToIndex(i)))
+    # Add pickup and delivery constraints with relaxed sequence
+    try:
+        for pickup, delivery in data['pickups_deliveries']:
+            print(f"Adding pickup and delivery constraints for pickup {pickup} and delivery {delivery}")
+            routing.AddPickupAndDelivery(manager.NodeToIndex(pickup), manager.NodeToIndex(delivery))
+            routing.solver().Add(routing.VehicleVar(manager.NodeToIndex(pickup)) == routing.VehicleVar(manager.NodeToIndex(delivery)))
+            routing.solver().Add(time_dimension.CumulVar(manager.NodeToIndex(pickup)) <= time_dimension.CumulVar(manager.NodeToIndex(delivery)))
+        print("Pickup and delivery constraints added successfully.")
+    except Exception as e:
+        print(f"Exception in adding constraints for pickup {pickup} and delivery {delivery}: {str(e)}")
+        return []
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_parameters.time_limit.seconds = 30
 
+    print("Attempting to solve...")  # Log before solving
     solution = routing.SolveWithParameters(search_parameters)
-    if solution:
-        return extract_solution(manager, routing, solution, time_dimension, locations, names)
-    logger.error("Solver failed to find a solution.")
-    return {"status": "No solution found"}
+    if not solution:
+        print("No solution found!")
+        return []
 
-def extract_solution(manager, routing, solution, time_dimension, locations, names):
-    route = []
+    print("Solution found, processing route...")  # Log successful solution finding
     index = routing.Start(0)
+    plan_output = []
     while not routing.IsEnd(index):
         node_index = manager.IndexToNode(index)
-        route.append({
-            'location': locations[node_index],
-            'name': names[node_index],
-            'index': node_index,
-            'time': solution.Min(time_dimension.CumulVar(index))
-        })
+        plan_output.append(requests[node_index])
         index = solution.Value(routing.NextVar(index))
-    return {'status': 'Solution found', 'route': route}
+
+    return plan_output
+
+# Function to process the requests and return the sorted array
+def process_requests(requests):
+    sorted_requests = solve_vrp(requests)
+    return sorted_requests
+
+@app.route('/optimize_route', methods=['POST'])
+def optimize_route():
+    try:
+        requests = request.json
+        print("Received requests: ", requests)  # Logging the received requests
+        sorted_requests = process_requests(requests)
+        if not sorted_requests:
+            return jsonify({"error": "No valid route found with the given constraints."}), 400
+        return jsonify(sorted_requests)
+    except Exception as e:
+        print("Exception: ", str(e))  # Logging the exception
+        return jsonify({"error": str(e)}), 400
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)  # Changed port to avoid 403 Forbidden error
+    app.run(host='0.0.0.0', port=5001, debug=True)
